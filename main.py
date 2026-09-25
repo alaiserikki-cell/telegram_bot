@@ -11,7 +11,6 @@ The bot never posts anywhere public. Its only outbound messages go to REVIEW_CHA
 import asyncio
 import logging
 import sys
-from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError
@@ -64,15 +63,18 @@ async def send_review(bot, text: str, markup=None):
 
 # ------------------------------------------------------------------ pacing
 
-async def dispatch(bot):
-    """Send queued notes as drafts while this week's cap allows, best score first."""
+async def dispatch(bot, max_drafts: int | None = None):
+    """Send queued notes as drafts while this week's cap allows, best score first.
+    On Vercel each request drafts at most one note (~1-1.5 min) to stay inside the function time limit."""
+    done = 0
     async with _dispatch_lock:
-        while store.sent_this_week() < config.WEEKLY_CAP:
+        while store.sent_this_week() < config.WEEKLY_CAP and (max_drafts is None or done < max_drafts):
             waiting = store.queue()
             if not waiting:
                 return
             rec = waiting[0]
-            store.update(rec["note_id"], status="drafting")
+            done += 1
+            store.update(rec["note_id"], status="drafting", drafting_since=store.now())
             log.info("Drafting %s (score %s)", rec["note_id"], rec["total_score"])
             try:
                 result = await asyncio.to_thread(pipeline.develop, rec["text"], rec["score"])
@@ -123,7 +125,10 @@ async def on_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             + (f" This week's {config.WEEKLY_CAP} drafts are already sent; it waits for next week." if full else ""))
         else:
             await safe_send(context.bot, f"📥 Note captured: {scored['verdict']}. {scored.get('reason', '')}")
-        context.application.create_task(dispatch(context.bot))  # drafting takes ~1 min; don't block updates
+        if config.SERVERLESS:
+            await dispatch(context.bot, max_drafts=1)  # background tasks don't survive the request
+        else:
+            context.application.create_task(dispatch(context.bot))  # drafting takes ~1 min; don't block updates
     except Exception as e:  # never crash the bot
         log.error("  pipeline failed: %s", e)
 
@@ -142,21 +147,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.edit_message_reply_markup(None)
     if action == "a":
-        path = store.save_approved(rec)
+        name, md = store.save_approved(rec)
         store.update(note_id, status="approved", decision="approved", decided_at=store.now())
-        await query.message.reply_text(f"✅ Approved and saved as approved/{Path(path).name}\n"
-                                       "Post it on LinkedIn yourself when you're ready.")
+        await query.message.reply_document(document=md.encode("utf-8"), filename=name,
+                                           caption="✅ Approved and saved. Post it on LinkedIn yourself when you're ready.")
     elif action == "k":
         store.update(note_id, status="killed", decision="killed", decided_at=store.now())
         await query.message.reply_text("🗑 Killed. Logged and dropped.")
     elif action == "r":
-        context.chat_data["redo"] = note_id
+        store.set_redo(note_id)
         await query.message.reply_text("🔁 What should change? Reply with one line.")
 
 
 async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A plain message in Meera's private chat: the one-line instruction after pressing Redo."""
-    note_id = context.chat_data.pop("redo", None)
+    note_id = store.pop_redo()
     if not note_id:
         await update.message.reply_text("Notes go in the notes channel. Here: /stats, or press Redo on a draft first.")
         return
@@ -169,7 +174,7 @@ async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error("redo failed: %s", e)
         result = {"draft": {"error": str(e)}}
     if "error" in result["draft"]:
-        context.chat_data["redo"] = note_id
+        store.set_redo(note_id)
         await update.message.reply_text(f"⚠️ Redraft failed ({result['draft']['error']}). Send the instruction again to retry.")
         return
     store.update(note_id, result=result, decision="redo", redo_count=rec.get("redo_count", 0) + 1)
@@ -186,6 +191,10 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Approved this week: {s['approved_week']} / {config.WEEKLY_CAP} target\n"
         f"Drafts sent this week: {s['sent_week']} / {config.WEEKLY_CAP}\n"
         f"Waiting in queue: {s['queued']} · awaiting your review: {s['awaiting']}")
+
+
+async def on_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_document(document=store.log_csv().encode("utf-8"), filename="log.csv")
 
 
 # ------------------------------------------------------------------ setup / plumbing
@@ -235,17 +244,21 @@ def check_config() -> list[str]:
     return problems
 
 
-def build_app(setup_mode: bool = False) -> Application:
-    """In setup mode only /start and chat-id logging run, so you can discover the ids for .env."""
-    app = (Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init)
-           .concurrent_updates(True).build())
+def build_app(setup_mode: bool = False, webhook: bool = False) -> Application:
+    """Polling (laptop) or webhook (Vercel, see app.py).
+    In setup mode only /start and chat-id logging run, so you can discover the ids for .env."""
+    builder = Application.builder().token(config.TELEGRAM_BOT_TOKEN)
+    builder = builder.updater(None) if webhook else builder.post_init(post_init).concurrent_updates(True)
+    app = builder.build()
     if not setup_mode:
         review = review_chat_filter()
         app.add_handler(MessageHandler(notes_channel_filter(), on_note))
         app.add_handler(CallbackQueryHandler(on_button))
         app.add_handler(CommandHandler("stats", on_stats, filters=review))
+        app.add_handler(CommandHandler("log", on_log, filters=review))
         app.add_handler(MessageHandler(review & filters.TEXT & ~filters.COMMAND, on_review_text))
-        app.job_queue.run_repeating(dispatch_job, interval=3600, first=10)  # picks up the new week's cap
+        if not webhook:  # on Vercel, Vercel Cron calls /api/cron instead
+            app.job_queue.run_repeating(dispatch_job, interval=3600, first=10)  # picks up the new week's cap
     app.add_handler(CommandHandler("start", on_start, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.ALL, on_other))
     app.add_error_handler(on_error)

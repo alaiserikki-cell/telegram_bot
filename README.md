@@ -58,7 +58,24 @@ python backlog.py voice draft.txt        # voice score + citations for any draft
 | `backlog.py` | CLI for `notes/` |
 | `published/` | Meera's 15 pieces, the only voice reference |
 
-## Running it
+## Deploying on Vercel (webhook mode)
+
+`app.py` is the Vercel entrypoint (FastAPI). Telegram pushes updates to `/api/telegram`; Vercel Cron calls
+`/api/cron` daily at 09:00 IST to send queued drafts; state lives in Upstash Redis.
+
+1. Vercel project → **Storage / Marketplace → Upstash for Redis** → create a free database and connect it to
+   this project (adds `KV_REST_API_URL` and `KV_REST_API_TOKEN` automatically).
+2. **Settings → Environment Variables**: `GEMINI_API_KEY`, `GEMINI_MODEL`, `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_CHAT_ID`, `REVIEW_CHAT_ID`, `WEEKLY_CAP`, plus two random strings `WEBHOOK_SECRET` and
+   `CRON_SECRET` (make one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+3. Redeploy, then open `https://<your-app>.vercel.app/` → should show `"ok": true`.
+4. Register the webhook once: open `https://<your-app>.vercel.app/api/setup?key=<WEBHOOK_SECRET>`.
+5. Stop any laptop copy (`python main.py`); a registered webhook and polling can't run together.
+   To go back to laptop mode: `python -c "import requests,config; print(requests.get(f'https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/deleteWebhook').json())"`
+
+On Vercel, approved posts are sent to Meera as `.md` files in Telegram, and `/log` sends `log.csv`.
+
+## Running it on a laptop
 
 Double-click `start_bot.bat` (or run `python main.py` in this folder). Leave the window open;
 the bot works while it's running. Close the window (or Ctrl+C) to stop it.

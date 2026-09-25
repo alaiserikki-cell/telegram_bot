@@ -3,3 +3,4 @@ python-telegram-bot[job-queue]>=22
 feedparser
 python-dotenv
 requests
+fastapi

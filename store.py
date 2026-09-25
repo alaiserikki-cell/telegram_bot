@@ -1,19 +1,27 @@
-"""Queue + log. State lives in queue.json; log.csv is regenerated from it on every save.
+"""Queue + log.
 
-Each operation loads from disk and saves back, so the bot and the backlog CLI can both use it.
+Two backends, same interface:
+- local files (laptop): queue.json, log.csv, approved/*.md next to the code
+- Upstash Redis (Vercel, whose filesystem is not persistent): used when KV_REST_API_URL / UPSTASH_REDIS_REST_URL is set
+
+Each operation reads and writes one note at a time, so the bot and the backlog CLI can both use it.
 """
 import csv
+import io
 import json
 import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 import config
 
 IST = timezone(timedelta(hours=5, minutes=30))  # Meera is in Mumbai; weeks run Mon-Sun IST
 LOG_COLUMNS = ["note_id", "source", "received_at", "verdict", "total_score",
                "drafted_at", "decision", "decided_at", "redo_count"]
+STALE_DRAFTING = timedelta(minutes=10)  # a draft interrupted (crash/timeout) goes back to the queue
 _lock = threading.Lock()
 
 
@@ -29,35 +37,60 @@ def week_start() -> datetime:
 def _this_week(ts: str | None) -> bool:
     return bool(ts) and datetime.fromisoformat(ts) >= week_start()
 
+# ------------------------------------------------------------------ backends
+
+
+def _redis(*cmd):
+    r = requests.post(config.REDIS_URL, json=list(cmd), timeout=15,
+                      headers={"Authorization": f"Bearer {config.REDIS_TOKEN}"})
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+NOTES_KEY, APPROVED_KEY, REDO_KEY = "skinstinct:notes", "skinstinct:approved", "skinstinct:redo"
+
 
 def load() -> dict:
+    if config.REDIS_URL:
+        flat = _redis("HGETALL", NOTES_KEY) or []
+        return {flat[i]: json.loads(flat[i + 1]) for i in range(0, len(flat), 2)}
     if not config.QUEUE_FILE.exists():
         return {}
     return json.loads(config.QUEUE_FILE.read_text(encoding="utf-8"))
 
 
-def _save(notes: dict):
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = config.QUEUE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(notes, indent=1, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, config.QUEUE_FILE)
-    with open(config.LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_COLUMNS, extrasaction="ignore")
-        w.writeheader()
-        for n in sorted(notes.values(), key=lambda n: n["received_at"]):
-            w.writerow({k: n.get(k, "") for k in LOG_COLUMNS})
-
-
-def update(note_id: str, **fields) -> dict:
+def _put(rec: dict):
+    if config.REDIS_URL:
+        _redis("HSET", NOTES_KEY, rec["note_id"], json.dumps(rec, ensure_ascii=False))
+        return
     with _lock:
         notes = load()
-        notes[note_id].update(fields)
-        _save(notes)
-        return notes[note_id]
+        notes[rec["note_id"]] = rec
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = config.QUEUE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(notes, indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, config.QUEUE_FILE)
+        config.LOG_FILE.write_text(log_csv(notes), encoding="utf-8", newline="")
+
+# ------------------------------------------------------------------ notes
 
 
 def get(note_id: str) -> dict | None:
+    if config.REDIS_URL:
+        raw = _redis("HGET", NOTES_KEY, note_id)
+        return json.loads(raw) if raw else None
     return load().get(note_id)
+
+
+def exists(note_id: str) -> bool:
+    return get(note_id) is not None
+
+
+def update(note_id: str, **fields) -> dict:
+    rec = get(note_id)
+    rec.update(fields)
+    _put(rec)
+    return rec
 
 
 def add(note_id: str, source: str, text: str, scored: dict) -> dict:
@@ -66,54 +99,90 @@ def add(note_id: str, source: str, text: str, scored: dict) -> dict:
     rec = {"note_id": note_id, "source": source, "text": text, "received_at": now(),
            "verdict": scored["verdict"], "total_score": scored.get("total_score", 0), "score": scored,
            "status": status, "drafted_at": "", "decision": "", "decided_at": "", "redo_count": 0}
-    with _lock:
-        notes = load()
-        notes[note_id] = rec
-        _save(notes)
+    _put(rec)
     return rec
 
 
-def exists(note_id: str) -> bool:
-    return note_id in load()
+def _waiting(n: dict) -> bool:
+    if n["status"] == "queued":
+        return True
+    since = n.get("drafting_since")
+    return n["status"] == "drafting" and bool(since) and datetime.now(IST) - datetime.fromisoformat(since) > STALE_DRAFTING
 
 
-def queue() -> list[dict]:
+def queue(notes: dict | None = None) -> list[dict]:
     """Waiting notes, best first: 'develop' before 'hold', then by total score."""
-    waiting = [n for n in load().values() if n["status"] == "queued"]
-    return sorted(waiting, key=lambda n: (n["verdict"] != "develop", -n["total_score"], n["received_at"]))
+    notes = load() if notes is None else notes
+    return sorted((n for n in notes.values() if _waiting(n)),
+                  key=lambda n: (n["verdict"] != "develop", -n["total_score"], n["received_at"]))
 
 
-def sent_this_week() -> int:
+def sent_this_week(notes: dict | None = None) -> int:
     """First drafts sent this week (redos don't count against the cap)."""
-    return sum(1 for n in load().values() if _this_week(n.get("drafted_at")))
+    notes = load() if notes is None else notes
+    return sum(1 for n in notes.values() if _this_week(n.get("drafted_at")))
 
 
 def stats() -> dict:
-    notes = list(load().values())
+    notes = load()
+    vals = list(notes.values())
     return {
-        "captured": len(notes),
-        "drafted": sum(1 for n in notes if n.get("drafted_at")),
-        "approved": sum(1 for n in notes if n.get("decision") == "approved"),
-        "approved_week": sum(1 for n in notes if n.get("decision") == "approved" and _this_week(n.get("decided_at"))),
-        "sent_week": sent_this_week(),
-        "queued": len(queue()),
-        "awaiting": sum(1 for n in notes if n["status"] == "in_review"),
+        "captured": len(vals),
+        "drafted": sum(1 for n in vals if n.get("drafted_at")),
+        "approved": sum(1 for n in vals if n.get("decision") == "approved"),
+        "approved_week": sum(1 for n in vals if n.get("decision") == "approved" and _this_week(n.get("decided_at"))),
+        "sent_week": sent_this_week(notes),
+        "queued": len(queue(notes)),
+        "awaiting": sum(1 for n in vals if n["status"] == "in_review"),
     }
 
 
-def save_approved(rec: dict) -> str:
-    """Write the approved draft to approved/YYYY-MM-DD_<slug>.md and return the path."""
-    config.APPROVED_DIR.mkdir(parents=True, exist_ok=True)
+def log_csv(notes: dict | None = None) -> str:
+    notes = load() if notes is None else notes
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=LOG_COLUMNS, extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    for n in sorted(notes.values(), key=lambda n: n["received_at"]):
+        w.writerow({k: n.get(k, "") for k in LOG_COLUMNS})
+    return buf.getvalue()
+
+# ------------------------------------------------------------------ redo + approved
+
+
+def set_redo(note_id: str | None):
+    """Remember which draft Meera pressed Redo on (survives between serverless requests)."""
+    if config.REDIS_URL:
+        _redis("SET", REDO_KEY, note_id) if note_id else _redis("DEL", REDO_KEY)
+    else:
+        path = config.DATA_DIR / "redo.txt"
+        path.write_text(note_id, encoding="utf-8") if note_id else path.unlink(missing_ok=True)
+
+
+def pop_redo() -> str | None:
+    if config.REDIS_URL:
+        note_id = _redis("GET", REDO_KEY)
+    else:
+        path = config.DATA_DIR / "redo.txt"
+        note_id = path.read_text(encoding="utf-8").strip() if path.exists() else None
+    set_redo(None)
+    return note_id or None
+
+
+def save_approved(rec: dict) -> tuple[str, str]:
+    """Save the approved draft as YYYY-MM-DD_<slug>.md. Returns (filename, markdown)."""
     result = rec["result"]
     slug = re.sub(r"[^a-z0-9]+", "-", rec["score"].get("core_idea", rec["note_id"]).lower()).strip("-")[:50]
-    path = config.APPROVED_DIR / f"{datetime.now(IST):%Y-%m-%d}_{slug}.md"
+    name = f"{datetime.now(IST):%Y-%m-%d}_{slug}.md"
     n = result.get("news")
     news = f"{n['title']} ({n['source']}, {n['date']}) {n['link']}" if n else "none"
     claims = "\n".join(f"- {c}" for c in result["draft"]["claims_to_check"]) or "- none"
-    path.write_text(
-        f"# {rec['score'].get('core_idea', '')}\n\n"
-        f"- Note: {rec['note_id']} ({rec['source']})\n- Approved: {now()}\n- News: {news}\n"
-        f"- Redos: {rec.get('redo_count', 0)}\n\n## Post\n\n{result['draft']['draft']}\n\n"
-        f"## Checked before posting\n\n{claims}\n\n## Source note\n\n{rec['text']}\n",
-        encoding="utf-8")
-    return str(path)
+    md = (f"# {rec['score'].get('core_idea', '')}\n\n"
+          f"- Note: {rec['note_id']} ({rec['source']})\n- Approved: {now()}\n- News: {news}\n"
+          f"- Redos: {rec.get('redo_count', 0)}\n\n## Post\n\n{result['draft']['draft']}\n\n"
+          f"## Checked before posting\n\n{claims}\n\n## Source note\n\n{rec['text']}\n")
+    if config.REDIS_URL:
+        _redis("HSET", APPROVED_KEY, name, md)
+    else:
+        config.APPROVED_DIR.mkdir(parents=True, exist_ok=True)
+        (config.APPROVED_DIR / name).write_text(md, encoding="utf-8")
+    return name, md

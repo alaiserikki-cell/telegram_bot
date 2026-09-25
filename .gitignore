@@ -6,3 +6,5 @@ queue.json
 queue.tmp
 log.csv
 approved/
+redo.txt
+.vercel
