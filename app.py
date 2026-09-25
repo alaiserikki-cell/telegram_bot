@@ -14,6 +14,7 @@ from telegram import Bot, Update
 
 import config
 import main
+import store
 
 app = FastAPI()
 
@@ -25,8 +26,13 @@ def _same(a: str, b: str) -> bool:
 @app.get("/")
 def health():
     problems = main.check_config()
-    if not config.REDIS_URL:
-        problems.append("No Redis configured (add Upstash for Redis from the Vercel Marketplace)")
+    if not config.SUPABASE_URL or not config.SUPABASE_KEY:
+        problems.append("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
+    else:
+        try:
+            store.load()
+        except Exception as e:
+            problems.append(f"Supabase not reachable or tables missing (run supabase_schema.sql): {type(e).__name__}")
     if not config.WEBHOOK_SECRET:
         problems.append("WEBHOOK_SECRET is not set")
     return {"ok": not problems, "problems": problems, "model": config.GEMINI_MODEL, "weekly_cap": config.WEEKLY_CAP}

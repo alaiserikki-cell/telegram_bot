@@ -2,7 +2,8 @@
 
 Two backends, same interface:
 - local files (laptop): queue.json, log.csv, approved/*.md next to the code
-- Upstash Redis (Vercel, whose filesystem is not persistent): used when KV_REST_API_URL / UPSTASH_REDIS_REST_URL is set
+- Supabase (Vercel, whose filesystem is not persistent): used when SUPABASE_URL is set.
+  Tables from supabase_schema.sql, accessed through Supabase's REST API.
 
 Each operation reads and writes one note at a time, so the bot and the backlog CLI can both use it.
 """
@@ -40,28 +41,32 @@ def _this_week(ts: str | None) -> bool:
 # ------------------------------------------------------------------ backends
 
 
-def _redis(*cmd):
-    r = requests.post(config.REDIS_URL, json=list(cmd), timeout=15,
-                      headers={"Authorization": f"Bearer {config.REDIS_TOKEN}"})
+def _sb(method: str, table: str, params: dict | None = None, body=None):
+    """One call to Supabase's REST API (PostgREST)."""
+    headers = {"apikey": config.SUPABASE_KEY, "Authorization": f"Bearer {config.SUPABASE_KEY}"}
+    if method == "POST":  # upsert
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    r = requests.request(method, f"{config.SUPABASE_URL}/rest/v1/{table}", params=params, json=body,
+                         headers=headers, timeout=15)
     r.raise_for_status()
-    return r.json().get("result")
+    return r.json() if r.content else None
 
 
-NOTES_KEY, APPROVED_KEY, REDO_KEY = "skinstinct:notes", "skinstinct:approved", "skinstinct:redo"
+def _cloud() -> bool:
+    return bool(config.SUPABASE_URL)
 
 
 def load() -> dict:
-    if config.REDIS_URL:
-        flat = _redis("HGETALL", NOTES_KEY) or []
-        return {flat[i]: json.loads(flat[i + 1]) for i in range(0, len(flat), 2)}
+    if _cloud():
+        return {row["data"]["note_id"]: row["data"] for row in _sb("GET", "notes", {"select": "data"})}
     if not config.QUEUE_FILE.exists():
         return {}
     return json.loads(config.QUEUE_FILE.read_text(encoding="utf-8"))
 
 
 def _put(rec: dict):
-    if config.REDIS_URL:
-        _redis("HSET", NOTES_KEY, rec["note_id"], json.dumps(rec, ensure_ascii=False))
+    if _cloud():
+        _sb("POST", "notes", body={"note_id": rec["note_id"], "data": rec, "updated_at": now()})
         return
     with _lock:
         notes = load()
@@ -76,9 +81,9 @@ def _put(rec: dict):
 
 
 def get(note_id: str) -> dict | None:
-    if config.REDIS_URL:
-        raw = _redis("HGET", NOTES_KEY, note_id)
-        return json.loads(raw) if raw else None
+    if _cloud():
+        rows = _sb("GET", "notes", {"select": "data", "note_id": f"eq.{note_id}"})
+        return rows[0]["data"] if rows else None
     return load().get(note_id)
 
 
@@ -151,16 +156,20 @@ def log_csv(notes: dict | None = None) -> str:
 
 def set_redo(note_id: str | None):
     """Remember which draft Meera pressed Redo on (survives between serverless requests)."""
-    if config.REDIS_URL:
-        _redis("SET", REDO_KEY, note_id) if note_id else _redis("DEL", REDO_KEY)
+    if _cloud():
+        if note_id:
+            _sb("POST", "kv", body={"key": "redo", "value": note_id})
+        else:
+            _sb("DELETE", "kv", {"key": "eq.redo"})
     else:
         path = config.DATA_DIR / "redo.txt"
         path.write_text(note_id, encoding="utf-8") if note_id else path.unlink(missing_ok=True)
 
 
 def pop_redo() -> str | None:
-    if config.REDIS_URL:
-        note_id = _redis("GET", REDO_KEY)
+    if _cloud():
+        rows = _sb("GET", "kv", {"select": "value", "key": "eq.redo"})
+        note_id = rows[0]["value"] if rows else None
     else:
         path = config.DATA_DIR / "redo.txt"
         note_id = path.read_text(encoding="utf-8").strip() if path.exists() else None
@@ -180,8 +189,8 @@ def save_approved(rec: dict) -> tuple[str, str]:
           f"- Note: {rec['note_id']} ({rec['source']})\n- Approved: {now()}\n- News: {news}\n"
           f"- Redos: {rec.get('redo_count', 0)}\n\n## Post\n\n{result['draft']['draft']}\n\n"
           f"## Checked before posting\n\n{claims}\n\n## Source note\n\n{rec['text']}\n")
-    if config.REDIS_URL:
-        _redis("HSET", APPROVED_KEY, name, md)
+    if _cloud():
+        _sb("POST", "approved", body={"name": name, "markdown": md})
     else:
         config.APPROVED_DIR.mkdir(parents=True, exist_ok=True)
         (config.APPROVED_DIR / name).write_text(md, encoding="utf-8")

@@ -61,11 +61,12 @@ python backlog.py voice draft.txt        # voice score + citations for any draft
 ## Deploying on Vercel (webhook mode)
 
 `app.py` is the Vercel entrypoint (FastAPI). Telegram pushes updates to `/api/telegram`; Vercel Cron calls
-`/api/cron` daily at 09:00 IST to send queued drafts; state lives in Upstash Redis.
+`/api/cron` daily at 09:00 IST to send queued drafts; state lives in Supabase.
 
-1. Vercel project → **Storage / Marketplace → Upstash for Redis** → create a free database and connect it to
-   this project (adds `KV_REST_API_URL` and `KV_REST_API_TOKEN` automatically).
-2. **Settings → Environment Variables**: `GEMINI_API_KEY`, `GEMINI_MODEL`, `TELEGRAM_BOT_TOKEN`,
+1. Supabase: create a project → **SQL Editor** → paste `supabase_schema.sql` → **Run**.
+   Then **Project Settings → API**: copy the Project URL and the **service_role / secret** key (not anon).
+   (Or connect Supabase from the Vercel Marketplace, which adds these variables for you.)
+2. **Settings → Environment Variables**: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `TELEGRAM_BOT_TOKEN`,
    `TELEGRAM_CHAT_ID`, `REVIEW_CHAT_ID`, `WEEKLY_CAP`, plus two random strings `WEBHOOK_SECRET` and
    `CRON_SECRET` (make one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
 3. Redeploy, then open `https://<your-app>.vercel.app/` → should show `"ok": true`.

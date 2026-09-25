@@ -21,10 +21,11 @@ WEEKLY_CAP = int(os.getenv("WEEKLY_CAP", "3"))
 
 PUBLISHED_DIR = ROOT / "published"
 NOTES_DIR = ROOT / "notes"
-# Vercel: webhook mode + Upstash Redis storage (its filesystem doesn't persist).
+# Vercel: webhook mode + Supabase storage (its filesystem doesn't persist).
 SERVERLESS = bool(os.getenv("VERCEL"))
-REDIS_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL", "")
-REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+# Names match what the Supabase <-> Vercel integration sets. Use the service-role/secret key, never the anon key.
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")).rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Telegram sends it back on every webhook call
 CRON_SECRET = os.getenv("CRON_SECRET", "")        # Vercel Cron sends it as a Bearer token
 
