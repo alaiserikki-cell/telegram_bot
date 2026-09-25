@@ -58,14 +58,11 @@ python backlog.py voice draft.txt        # voice score + citations for any draft
 | `backlog.py` | CLI for `notes/` |
 | `published/` | Meera's 15 pieces, the only voice reference |
 
-## Deploying (runs 24/7)
+## Running it
 
-It's a long-running worker with no web server, so deploy it as a **worker/background service**.
-State (`queue.json`, `log.csv`, `approved/`) must live on a persistent disk: set `DATA_DIR` to it.
+Double-click `start_bot.bat` (or run `python main.py` in this folder). Leave the window open;
+the bot works while it's running. Close the window (or Ctrl+C) to stop it.
 
-- **Railway**: New project → Deploy from GitHub repo → add a Volume mounted at `/data` →
-  Variables: everything from `.env` plus `DATA_DIR=/data`. Start command comes from `Procfile`.
-- **VM** (e.g. Google Cloud e2-micro): copy the folder, `pip install -r requirements.txt`, fill `.env`,
-  run `python main.py` under `systemd` or `tmux`.
-
-Only one copy of the bot may run at a time (Telegram allows one polling connection per token).
+- If the laptop is off or asleep, Telegram holds new notes for 24 hours and the bot catches up when started.
+- `queue.json`, `log.csv` and `approved/` are written in this folder.
+- Run only one copy at a time (Telegram allows one connection per bot token).

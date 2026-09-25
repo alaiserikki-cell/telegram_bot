@@ -21,8 +21,7 @@ WEEKLY_CAP = int(os.getenv("WEEKLY_CAP", "3"))
 
 PUBLISHED_DIR = ROOT / "published"
 NOTES_DIR = ROOT / "notes"
-# Where state is written (queue, log, approved posts). On a server, point this at a persistent disk.
-DATA_DIR = Path(os.getenv("DATA_DIR") or ROOT)
+DATA_DIR = ROOT  # queue.json, log.csv and approved/ live next to the code
 APPROVED_DIR = DATA_DIR / "approved"
 QUEUE_FILE = DATA_DIR / "queue.json"
 LOG_FILE = DATA_DIR / "log.csv"
