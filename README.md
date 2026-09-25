@@ -24,11 +24,11 @@ note in private channel ──► score (Gemini) ──► queue ──► max 3
 
 **Telegram (Meera):**
 - Post a note in the notes channel → she gets `📥 Note captured: develop, 18/20. Queue position 1.`
-- Drafts arrive in her private chat (max `WEEKLY_CAP` per week, Mon–Sun IST, highest score first):
+- Drafts arrive as a reply under the note in the channel (max `WEEKLY_CAP` per week, Mon–Sun IST, highest score first):
   source note, why picked, news used, the draft, claims to check (with citations), voice score.
-- **Approve** → saved to `approved/YYYY-MM-DD_<slug>.md` · **Redo** → she replies with one line and gets a new draft ·
+- **Approve** → saved to `approved/YYYY-MM-DD_<slug>.md` · **Redo** → her next post in the channel is used as the instruction (not a new note) and she gets a new draft ·
   **Kill** → logged and dropped.
-- `/stats` → notes captured, drafted, approved, approved this week vs target.
+- `/stats` (typed in the channel) → notes captured, drafted, approved, approved this week vs target.
 
 **Backlog (CLI):**
 ```
@@ -41,7 +41,7 @@ python backlog.py voice draft.txt        # voice score + citations for any draft
 
 ## Rules the code enforces
 
-- Output only goes to `REVIEW_CHAT_ID`; the bot refuses to start normally if it equals the notes channel.
+- Output only goes to `REVIEW_CHAT_ID` (default: the private notes channel, as replies under each note). Nothing is posted publicly.
 - Only channel posts from `TELEGRAM_CHAT_ID` are processed; buttons and `/stats` only work in `REVIEW_CHAT_ID`.
 - Claims not in the note or the fetched news item are tagged `[VERIFY]`; code also flags unsourced numbers and buzzwords.
 - News comes only from a real Google News RSS item from the last 30 days, or the draft says "none".

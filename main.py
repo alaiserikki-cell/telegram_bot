@@ -1,9 +1,9 @@
 """Telegram bot (long polling).
 
 Flow: a post in Meera's private notes channel is scored and queued. Up to WEEKLY_CAP drafts a week
-(best score first) are developed (news + draft + voice score + citations) and sent to Meera's private
-chat with Approve / Redo / Kill buttons. Only channel posts from TELEGRAM_CHAT_ID are accepted, and
-buttons/commands only work in REVIEW_CHAT_ID.
+(best score first) are developed (news + draft + voice score + citations) and posted to REVIEW_CHAT_ID
+with Approve / Redo / Kill buttons. By default that is the notes channel itself: drafts appear as a
+reply under the note, and Redo instructions and /stats, /log are typed in the channel too.
 
 The bot never posts anywhere public. Its only outbound messages go to REVIEW_CHAT_ID
 (or, for /start, back to whoever sent it, so you can discover your chat id during setup).
@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sys
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
 from telegram.error import NetworkError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
@@ -46,8 +46,15 @@ def buttons(note_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
-async def send_review(bot, text: str, markup=None):
-    """Send to Meera's private chat, split to fit Telegram's 4096-char limit. Buttons go on the last part."""
+def _reply_to(note_id: str | None) -> ReplyParameters | None:
+    """In channel-review mode, thread bot messages under the note they're about."""
+    if config.REVIEW_IN_CHANNEL and note_id and note_id.startswith("tg_"):
+        return ReplyParameters(message_id=int(note_id[3:]), allow_sending_without_reply=True)
+    return None
+
+
+async def send_review(bot, text: str, markup=None, note_id: str | None = None):
+    """Send to REVIEW_CHAT_ID, split to fit Telegram's 4096-char limit. Buttons go on the last part."""
     chunks, current = [], ""
     for para in text.split("\n\n"):
         if current and len(current) + len(para) + 2 > 4000:
@@ -58,6 +65,7 @@ async def send_review(bot, text: str, markup=None):
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id=config.REVIEW_CHAT_ID, text=chunk[:4096],
                                reply_markup=markup if i == len(chunks) - 1 else None,
+                               reply_parameters=_reply_to(note_id) if i == 0 else None,
                                disable_web_page_preview=True)
 
 
@@ -83,11 +91,12 @@ async def dispatch(bot, max_drafts: int | None = None):
                 result = {"draft": {"error": str(e)}}
             if "error" in (result.get("draft") or {"error": "no draft"}):
                 store.update(rec["note_id"], status="error", decision="error", decided_at=store.now())
-                await safe_send(bot, f"⚠️ Could not draft note {rec['note_id']}: {result['draft'].get('error')}")
+                await safe_send(bot, f"⚠️ Could not draft note {rec['note_id']}: {result['draft'].get('error')}",
+                                rec["note_id"])
                 continue
             store.update(rec["note_id"], status="in_review", drafted_at=store.now(), result=result)
             try:
-                await send_review(bot, pipeline.format_review(result), buttons(rec["note_id"]))
+                await send_review(bot, pipeline.format_review(result), buttons(rec["note_id"]), rec["note_id"])
             except Exception as e:
                 log.error("  sending review failed: %s", e)
 
@@ -96,22 +105,38 @@ async def dispatch_job(context: ContextTypes.DEFAULT_TYPE):
     await dispatch(context.bot)
 
 
-async def safe_send(bot, text: str):
+async def safe_send(bot, text: str, note_id: str | None = None):
     try:
-        await bot.send_message(chat_id=config.REVIEW_CHAT_ID, text=text, disable_web_page_preview=True)
+        await bot.send_message(chat_id=config.REVIEW_CHAT_ID, text=text, disable_web_page_preview=True,
+                               reply_parameters=_reply_to(note_id))
     except Exception as e:
         log.error("send failed: %s", e)
 
 
 # ------------------------------------------------------------------ notes in
 
+# Bot messages start with one of these; never treat them as notes (belt and braces: Telegram
+# doesn't normally deliver a bot's own channel posts back to it).
+BOT_MARKERS = ("📝", "📥", "🔁", "📊", "✅", "🗑", "⚠️")
+
+
 async def on_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post
-    text = post.text or post.caption or ""
+    text = (post.text or post.caption or "").strip()
     note_id = f"tg_{post.message_id}"
     log.info("Note received (msg %s): %r", post.message_id, text[:80])
-    if not text.strip() or store.exists(note_id):
+    if not text or text.startswith(BOT_MARKERS) or store.exists(note_id):
         return
+    if config.REVIEW_IN_CHANNEL:
+        # Reviewing inside the channel: commands and Redo instructions arrive as channel posts too.
+        command = text.split()[0].split("@")[0].lower()
+        if command == "/stats":
+            return await on_stats(update, context)
+        if command == "/log":
+            return await on_log(update, context)
+        redo_id = store.pop_redo()
+        if redo_id:
+            return await redo(context.bot, redo_id, text, post)
     try:
         scored = await asyncio.to_thread(pipeline.score, text)
         rec = store.add(note_id, "telegram", text, scored)
@@ -122,9 +147,10 @@ async def on_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(context.bot,
                             f"📥 Note captured: {scored['verdict']}, {rec['total_score']}/20. "
                             f"Queue position {position}."
-                            + (f" This week's {config.WEEKLY_CAP} drafts are already sent; it waits for next week." if full else ""))
+                            + (f" This week's {config.WEEKLY_CAP} drafts are already sent; it waits for next week." if full else ""),
+                            note_id)
         else:
-            await safe_send(context.bot, f"📥 Note captured: {scored['verdict']}. {scored.get('reason', '')}")
+            await safe_send(context.bot, f"📥 Note captured: {scored['verdict']}. {scored.get('reason', '')}", note_id)
         if config.SERVERLESS:
             await dispatch(context.bot, max_drafts=1)  # background tasks don't survive the request
         else:
@@ -156,18 +182,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🗑 Killed. Logged and dropped.")
     elif action == "r":
         store.set_redo(note_id)
-        await query.message.reply_text("🔁 What should change? Reply with one line.")
+        where = "Post it in this channel" if config.REVIEW_IN_CHANNEL else "Reply here"
+        await query.message.reply_text(f"🔁 What should change? {where} with one line; "
+                                       "your next message is used as the instruction, not as a new note.")
 
 
-async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A plain message in Meera's private chat: the one-line instruction after pressing Redo."""
-    note_id = store.pop_redo()
-    if not note_id:
-        await update.message.reply_text("Notes go in the notes channel. Here: /stats, or press Redo on a draft first.")
-        return
+async def redo(bot, note_id: str, instruction: str, message):
+    """Redraft `note_id` following Meera's one-line instruction (reuses the same news item)."""
     rec = store.get(note_id)
-    instruction = update.message.text.strip()
-    await update.message.reply_text("Redrafting…")
+    await message.reply_text("🔁 Redrafting…")
     try:
         result = await asyncio.to_thread(pipeline.develop, rec["text"], rec["score"], instruction, rec.get("result"))
     except Exception as e:
@@ -175,16 +198,25 @@ async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = {"draft": {"error": str(e)}}
     if "error" in result["draft"]:
         store.set_redo(note_id)
-        await update.message.reply_text(f"⚠️ Redraft failed ({result['draft']['error']}). Send the instruction again to retry.")
+        await message.reply_text(f"⚠️ Redraft failed ({result['draft']['error']}). Send the instruction again to retry.")
         return
     store.update(note_id, result=result, decision="redo", redo_count=rec.get("redo_count", 0) + 1)
-    await send_review(context.bot, f"🔁 Redo {rec.get('redo_count', 0) + 1}: \"{instruction}\"\n\n"
-                      + pipeline.format_review(result), buttons(note_id))
+    await send_review(bot, f"🔁 Redo {rec.get('redo_count', 0) + 1}: \"{instruction}\"\n\n"
+                      + pipeline.format_review(result), buttons(note_id), note_id)
+
+
+async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A plain message in Meera's private review chat: the one-line instruction after pressing Redo."""
+    note_id = store.pop_redo()
+    if not note_id:
+        await update.message.reply_text("Notes go in the notes channel. Here: /stats, or press Redo on a draft first.")
+        return
+    await redo(context.bot, note_id, update.message.text.strip(), update.message)
 
 
 async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = store.stats()
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📊 Notes captured: {s['captured']}\n"
         f"Drafted: {s['drafted']}\n"
         f"Approved: {s['approved']}\n"
@@ -194,7 +226,7 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_document(document=store.log_csv().encode("utf-8"), filename="log.csv")
+    await update.effective_message.reply_document(document=store.log_csv().encode("utf-8"), filename="log.csv")
 
 
 # ------------------------------------------------------------------ setup / plumbing
@@ -237,8 +269,6 @@ def check_config() -> list[str]:
             problems.append(f"{name} is not set")
         elif not value.lstrip("-").isdigit():
             problems.append(f"{name} must be a numeric chat id, got {value!r}")
-    if config.REVIEW_CHAT_ID and config.REVIEW_CHAT_ID == config.TELEGRAM_CHAT_ID:
-        problems.append("REVIEW_CHAT_ID must be Meera's private chat with the bot, not the notes channel")
     if not config.GEMINI_API_KEY:
         problems.append("GEMINI_API_KEY is not set")
     return problems

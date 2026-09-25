@@ -13,8 +13,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # The private channel the bot listens to. Messages from any other chat are ignored.
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-# Meera's private chat with the bot. Drafts go here, never back into the notes channel.
-REVIEW_CHAT_ID = os.getenv("REVIEW_CHAT_ID", "")
+# Where drafts and buttons go. Defaults to the notes channel itself (drafts appear as replies under the note).
+# Set it to Meera's private chat id to review there instead. Either way it's private; nothing is public.
+REVIEW_CHAT_ID = os.getenv("REVIEW_CHAT_ID") or TELEGRAM_CHAT_ID
+REVIEW_IN_CHANNEL = REVIEW_CHAT_ID == TELEGRAM_CHAT_ID
 
 NEWS_LOOKBACK_DAYS = int(os.getenv("NEWS_LOOKBACK_DAYS", "30"))
 WEEKLY_CAP = int(os.getenv("WEEKLY_CAP", "3"))
