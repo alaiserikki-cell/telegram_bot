@@ -24,7 +24,8 @@ alter table approved enable row level security;
 alter table kv       enable row level security;
 
 -- Handy view for looking at the log in the Supabase table editor.
-create or replace view log as
+-- security_invoker: the view obeys RLS of the caller, so the anon key can't read notes through it.
+create or replace view log with (security_invoker = on) as
 select data->>'note_id'     as note_id,
        data->>'source'      as source,
        data->>'received_at' as received_at,
