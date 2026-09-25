@@ -28,6 +28,8 @@ def health():
     problems = main.check_config()
     if not config.SUPABASE_URL or not config.SUPABASE_KEY:
         problems.append("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
+    elif not config.SUPABASE_URL.endswith(".supabase.co"):
+        problems.append(f"SUPABASE_URL should be your project URL like https://<ref>.supabase.co, got {config.SUPABASE_URL}")
     else:
         try:
             store.load()
