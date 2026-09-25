@@ -1,0 +1,8 @@
+.env
+__pycache__/
+bot.log
+# runtime state (lives in DATA_DIR on a server)
+queue.json
+queue.tmp
+log.csv
+approved/
